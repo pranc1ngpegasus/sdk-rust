@@ -7,7 +7,23 @@ use crate::{
         client::{PollActivityOptions, PollOptions, PollWorkflowOptions, WorkerClient},
     },
 };
-use backoff::{SystemClock, backoff::Backoff, exponential::ExponentialBackoff};
+use backon::{BackoffBuilder, ExponentialBuilder};
+
+/// Matches [`temporalio_client::retry::RetryOptions::task_poll_retry_policy`].
+const TASK_POLL_EXPONENTIAL: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_millis(200))
+    .with_jitter()
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(10))
+    .without_max_times();
+
+/// Matches [`temporalio_client::retry::RetryOptions::throttle_retry_policy`].
+const THROTTLE_POLL_EXPONENTIAL: ExponentialBuilder = ExponentialBuilder::new()
+    .with_min_delay(Duration::from_secs(1))
+    .with_jitter()
+    .with_factor(2.0)
+    .with_max_delay(Duration::from_secs(10))
+    .without_max_times();
 use crossbeam_utils::atomic::AtomicCell;
 use futures_util::{FutureExt, StreamExt, future::BoxFuture};
 use std::{
@@ -530,28 +546,10 @@ where
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time,
-            exponential_backoff: parking_lot::Mutex::new(ExponentialBackoff {
-                // Copied from RetryOptions::task_poll_retry_policy()
-                current_interval: Duration::from_millis(200),
-                initial_interval: Duration::from_millis(200),
-                randomization_factor: 0.2,
-                multiplier: 2.0,
-                max_interval: Duration::from_secs(10),
-                max_elapsed_time: None,
-                clock: SystemClock::default(),
-                start_time: std::time::Instant::now(),
-            }),
-            resource_exhausted_backoff: parking_lot::Mutex::new(ExponentialBackoff {
-                // Copied from RetryOptions::throttle_retry_policy()
-                current_interval: Duration::from_secs(1),
-                initial_interval: Duration::from_secs(1),
-                randomization_factor: 0.2,
-                multiplier: 2.0,
-                max_interval: Duration::from_secs(10),
-                max_elapsed_time: None,
-                clock: SystemClock::default(),
-                start_time: std::time::Instant::now(),
-            }),
+            exponential_backoff_builder: TASK_POLL_EXPONENTIAL,
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_EXPONENTIAL.build()),
+            resource_exhausted_backoff_builder: THROTTLE_POLL_EXPONENTIAL,
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_EXPONENTIAL.build()),
         });
         let rhc = report_handle.clone();
         let ingestor_task = if behavior.is_autoscaling() {
@@ -617,9 +615,10 @@ struct PollScalerReportHandle {
     scale_up_allowed: AtomicBool,
     last_successful_poll_time: Arc<AtomicCell<Option<SystemTime>>>,
 
-    // Exponential backoff for normal errors and resource exhausted errors
-    exponential_backoff: parking_lot::Mutex<ExponentialBackoff<SystemClock>>,
-    resource_exhausted_backoff: parking_lot::Mutex<ExponentialBackoff<SystemClock>>,
+    exponential_backoff_builder: ExponentialBuilder,
+    exponential_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
+    resource_exhausted_backoff_builder: ExponentialBuilder,
+    resource_exhausted_backoff: parking_lot::Mutex<backon::ExponentialBackoff>,
 }
 
 impl PollScalerReportHandle {
@@ -636,8 +635,9 @@ impl PollScalerReportHandle {
                     .store(Some(SystemTime::now()));
 
                 // Reset backoff on successful poll
-                self.exponential_backoff.lock().reset();
-                self.resource_exhausted_backoff.lock().reset();
+                *self.exponential_backoff.lock() = self.exponential_backoff_builder.build();
+                *self.resource_exhausted_backoff.lock() =
+                    self.resource_exhausted_backoff_builder.build();
 
                 if let PollerBehavior::SimpleMaximum(_) = self.behavior {
                     // We don't do auto-scaling with the simple max
@@ -674,9 +674,9 @@ impl PollScalerReportHandle {
             Err(e) => {
                 if matches!(self.behavior, PollerBehavior::Autoscaling { .. }) {
                     // Follow the same backoff logic as the retry client
-                    let mut backoff_duration = self.exponential_backoff.lock().next_backoff();
+                    let mut backoff_duration = self.exponential_backoff.lock().next();
                     if e.code() == Code::ResourceExhausted {
-                        backoff_duration = self.resource_exhausted_backoff.lock().next_backoff();
+                        backoff_duration = self.resource_exhausted_backoff.lock().next();
                     };
 
                     // Only propagate errors out if they weren't because of the short-circuiting
@@ -1285,8 +1285,10 @@ mod tests {
             ingested_last_period: Default::default(),
             scale_up_allowed: AtomicBool::new(true),
             last_successful_poll_time: Arc::new(AtomicCell::new(None)),
-            exponential_backoff: parking_lot::Mutex::new(ExponentialBackoff::default()),
-            resource_exhausted_backoff: parking_lot::Mutex::new(ExponentialBackoff::default()),
+            exponential_backoff_builder: TASK_POLL_EXPONENTIAL,
+            exponential_backoff: parking_lot::Mutex::new(TASK_POLL_EXPONENTIAL.build()),
+            resource_exhausted_backoff_builder: THROTTLE_POLL_EXPONENTIAL,
+            resource_exhausted_backoff: parking_lot::Mutex::new(THROTTLE_POLL_EXPONENTIAL.build()),
         });
 
         for _ in 0..20 {
